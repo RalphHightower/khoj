@@ -58,7 +58,7 @@ dependencies = [
     "uvicorn == 0.30.6",
     "aiohttp ~= 3.9.0",
     "langchain == 0.2.5",
-    "langchain-community == 0.2.9",
+    "langchain-community == 0.2.19",
     "requests >= 2.26.0",
     "tenacity == 8.3.0",
     "anyio == 3.7.1",
