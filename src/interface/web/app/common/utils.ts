@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import useSWR from "swr";
+import * as React from "react"
 
 export interface LocationData {
     city?: string;
@@ -67,6 +68,59 @@ export function useIsMobileWidth() {
     }, []);
 
     return isMobileWidth;
+}
+
+export const useMutationObserver = (
+    ref: React.MutableRefObject<HTMLElement | null>,
+    callback: MutationCallback,
+    options = {
+        attributes: true,
+        characterData: true,
+        childList: true,
+        subtree: true,
+    }
+) => {
+    React.useEffect(() => {
+        if (ref.current) {
+            const observer = new MutationObserver(callback)
+            observer.observe(ref.current, options)
+            return () => observer.disconnect()
+        }
+    }, [ref, callback, options])
+}
+
+export function useIsDarkMode() {
+    const [darkMode, setDarkMode] = useState(false);
+    const [initialLoadDone, setInitialLoadDone] = useState(false);
+
+    useEffect(() => {
+        if (localStorage.getItem("theme") === "dark") {
+            document.documentElement.classList.add("dark");
+            setDarkMode(true);
+        } else if (localStorage.getItem("theme") === "light") {
+            document.documentElement.classList.remove("dark");
+            setDarkMode(false);
+        } else {
+            const mq = window.matchMedia("(prefers-color-scheme: dark)");
+            if (mq.matches) {
+                document.documentElement.classList.add("dark");
+                setDarkMode(true);
+            }
+        }
+        setInitialLoadDone(true);
+    }, []);
+
+    useEffect(() => {
+        if (!initialLoadDone) return;
+        if (darkMode) {
+            document.documentElement.classList.add("dark");
+        } else {
+            document.documentElement.classList.remove("dark");
+        }
+        localStorage.setItem("theme", darkMode ? "dark" : "light");
+    }, [darkMode, initialLoadDone]);
+
+    return [darkMode, setDarkMode] as const;
 }
 
 export const convertBytesToText = (fileSize: number) => {

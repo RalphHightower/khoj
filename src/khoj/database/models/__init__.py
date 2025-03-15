@@ -209,6 +209,8 @@ class ChatModel(DbBaseModel):
     model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.OFFLINE)
     vision_enabled = models.BooleanField(default=False)
     ai_model_api = models.ForeignKey(AiModelApi, on_delete=models.CASCADE, default=None, null=True, blank=True)
+    description = models.TextField(default=None, null=True, blank=True)
+    strengths = models.TextField(default=None, null=True, blank=True)
 
     def __str__(self):
         return self.name
@@ -278,20 +280,19 @@ class Agent(DbBaseModel):
         GENERAL = "general"
         ONLINE = "online"
         NOTES = "notes"
-        SUMMARIZE = "summarize"
-        WEBPAGE = "webpage"
+        WEBPAGE = ("webpage",)
+        CODE = "code"
 
     class OutputModeOptions(models.TextChoices):
         # These map to various ConversationCommand types
-        TEXT = "text"
         IMAGE = "image"
-        AUTOMATION = "automation"
+        DIAGRAM = "diagram"
 
     creator = models.ForeignKey(
         KhojUser, on_delete=models.CASCADE, default=None, null=True, blank=True
     )  # Creator will only be null when the agents are managed by admin
     name = models.CharField(max_length=200)
-    personality = models.TextField()
+    personality = models.TextField(default=None, null=True, blank=True)
     input_tools = ArrayField(
         models.CharField(max_length=200, choices=InputToolOptions.choices), default=list, null=True, blank=True
     )
@@ -301,9 +302,10 @@ class Agent(DbBaseModel):
     managed_by_admin = models.BooleanField(default=False)
     chat_model = models.ForeignKey(ChatModel, on_delete=models.CASCADE)
     slug = models.CharField(max_length=200, unique=True)
-    style_color = models.CharField(max_length=200, choices=StyleColorTypes.choices, default=StyleColorTypes.BLUE)
+    style_color = models.CharField(max_length=200, choices=StyleColorTypes.choices, default=StyleColorTypes.ORANGE)
     style_icon = models.CharField(max_length=200, choices=StyleIconTypes.choices, default=StyleIconTypes.LIGHTBULB)
     privacy_level = models.CharField(max_length=30, choices=PrivacyLevel.choices, default=PrivacyLevel.PRIVATE)
+    is_hidden = models.BooleanField(default=False)
 
     def save(self, *args, **kwargs):
         is_new = self._state.adding
@@ -528,6 +530,7 @@ class TextToImageModelConfig(DbBaseModel):
         OPENAI = "openai"
         STABILITYAI = "stability-ai"
         REPLICATE = "replicate"
+        GOOGLE = "google"
 
     model_name = models.CharField(max_length=200, default="dall-e-3")
     model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.OPENAI)
@@ -545,11 +548,11 @@ class TextToImageModelConfig(DbBaseModel):
                 error[
                     "ai_model_api"
                 ] = "Both API key and OpenAI config cannot be set for OpenAI models. Please set only one of them."
-        if self.model_type != self.ModelType.OPENAI:
+        if self.model_type != self.ModelType.OPENAI and self.model_type != self.ModelType.GOOGLE:
             if not self.api_key:
-                error["api_key"] = "The API key field must be set for non OpenAI models."
+                error["api_key"] = "The API key field must be set for non OpenAI, non Google models."
             if self.ai_model_api:
-                error["ai_model_api"] = "AI Model API cannot be set for non OpenAI models."
+                error["ai_model_api"] = "AI Model API cannot be set for non OpenAI, non Google models."
         if error:
             raise ValidationError(error)
 

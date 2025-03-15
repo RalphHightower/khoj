@@ -321,6 +321,12 @@ def get_device() -> torch.device:
         return torch.device("cpu")
 
 
+def is_e2b_code_sandbox_enabled():
+    """Check if E2B code sandbox is enabled.
+    Set E2B_API_KEY environment variable to use it."""
+    return not is_none_or_empty(os.getenv("E2B_API_KEY"))
+
+
 class ConversationCommand(str, Enum):
     Default = "default"
     General = "general"
@@ -354,13 +360,16 @@ command_descriptions = {
 }
 
 command_descriptions_for_agent = {
-    ConversationCommand.General: "Agent can use the agents knowledge base and general knowledge.",
+    ConversationCommand.General: "Agent can use its own knowledge base and general knowledge.",
     ConversationCommand.Notes: "Agent can search the personal knowledge base for information, as well as its own.",
     ConversationCommand.Online: "Agent can search the internet for information.",
     ConversationCommand.Webpage: "Agent can read suggested web pages for information.",
-    ConversationCommand.Summarize: "Agent can read an entire document. Agents knowledge base must be a single document.",
     ConversationCommand.Research: "Agent can do deep research on a topic.",
+    ConversationCommand.Code: "Agent can run Python code to parse information, run complex calculations, create documents and charts.",
 }
+
+e2b_tool_description = "To run Python code in a E2B sandbox with no network access. Helpful to parse complex information, run calculations, create text documents and create charts with quantitative data. Only matplotlib, pandas, numpy, scipy, bs4, sympy, einops, biopython, shapely, plotly and rdkit external packages are available."
+terrarium_tool_description = "To run Python code in a Terrarium, Pyodide sandbox with no network access. Helpful to parse complex information, run complex calculations, create plaintext documents and create charts with quantitative data. Only matplotlib, panda, numpy, scipy, bs4 and sympy external packages are available."
 
 tool_descriptions_for_llm = {
     ConversationCommand.Default: "To use a mix of your internal knowledge and the user's personal knowledge, or if you don't entirely understand the query.",
@@ -368,15 +377,14 @@ tool_descriptions_for_llm = {
     ConversationCommand.Notes: "To search the user's personal knowledge base. Especially helpful if the question expects context from the user's notes or documents.",
     ConversationCommand.Online: "To search for the latest, up-to-date information from the internet. Note: **Questions about Khoj should always use this data source**",
     ConversationCommand.Webpage: "To use if the user has directly provided the webpage urls or you are certain of the webpage urls to read.",
-    ConversationCommand.Code: "To run Python code in a Pyodide sandbox with no network access. Helpful when need to parse complex information, run complex calculations, create plaintext documents, and create charts with quantitative data. Only matplotlib, panda, numpy, scipy, bs4 and sympy external packages are available.",
-    ConversationCommand.Summarize: "To retrieve an answer that depends on the entire document or a large text.",
+    ConversationCommand.Code: e2b_tool_description if is_e2b_code_sandbox_enabled() else terrarium_tool_description,
 }
 
 function_calling_description_for_llm = {
     ConversationCommand.Notes: "To search the user's personal knowledge base. Especially helpful if the question expects context from the user's notes or documents.",
     ConversationCommand.Online: "To search the internet for information. Useful to get a quick, broad overview from the internet. Provide all relevant context to ensure new searches, not in previous iterations, are performed.",
     ConversationCommand.Webpage: "To extract information from webpages. Useful for more detailed research from the internet. Usually used when you know the webpage links to refer to. Share the webpage links and information to extract in your query.",
-    ConversationCommand.Code: "To run Python code in a Pyodide sandbox with no network access. Helpful when need to parse complex information, run complex calculations, create plaintext documents, and create charts with quantitative data. Only matplotlib, panda, numpy, scipy, bs4 and sympy external packages are available.",
+    ConversationCommand.Code: e2b_tool_description if is_e2b_code_sandbox_enabled() else terrarium_tool_description,
 }
 
 mode_descriptions_for_llm = {
@@ -387,8 +395,6 @@ mode_descriptions_for_llm = {
 
 mode_descriptions_for_agent = {
     ConversationCommand.Image: "Agent can generate images in response. It cannot not use this to generate charts and graphs.",
-    ConversationCommand.Automation: "Agent can schedule a task to run at a scheduled date, time and frequency in response.",
-    ConversationCommand.Text: "Agent can generate text in response.",
     ConversationCommand.Diagram: "Agent can generate a visual representation that requires primitives like lines, rectangles, and text.",
 }
 
@@ -429,6 +435,18 @@ def generate_random_name():
 
     # Combine the words to form a name
     name = f"{adjective} {noun}"
+
+    return name
+
+
+def generate_random_internal_agent_name():
+    random_name = generate_random_name()
+
+    random_name = random_name.replace(" ", "_")
+
+    random_number = random.randint(1000, 9999)
+
+    name = f"{random_name}{random_number}"
 
     return name
 

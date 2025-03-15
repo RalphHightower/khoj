@@ -283,9 +283,14 @@ Go to http://localhost:42110/server/admin and login with the admin credentials y
 Ensure you are using **localhost, not 127.0.0.1**, to access the admin panel to avoid the CSRF error.
 :::
 
+:::info[CSRF Trusted Origin or Unset Cookie Error]
+If using a load balancer/reverse_proxy in front of your Khoj server: Set the environment variable KHOJ_ALLOWED_DOMAIN=your-internal-ip-or-domain to avoid this error.
+If unset, it defaults to KHOJ_DOMAIN.
+:::
+
 :::info[DISALLOWED HOST or Bad Request (400) Error]
 You may hit this if you try access Khoj exposed on a custom domain (e.g. 192.168.12.3 or example.com) or over HTTP.
-Set the environment variables KHOJ_DOMAIN=your-domain and KHOJ_NO_HTTPS=True if required to avoid this error.
+Set the environment variables KHOJ_DOMAIN=your-external-ip-or-domain and KHOJ_NO_HTTPS=True if required to avoid this error.
 :::
 
 :::tip[Note]
@@ -328,7 +333,7 @@ Using Ollama? See the [Ollama Integration](/advanced/ollama) section for more cu
    - Add your [Gemini API key](https://aistudio.google.com/app/apikey)
    - Give the configuration a friendly name like `Gemini`. Do not configure the API base url.
 2. Create a new [chat model](http://localhost:42110/server/admin/database/chatmodel/add)
-    - Set the `chat-model` field to a [Google Gemini chat model](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models#gemini-models). Example: `gemini-1.5-flash`.
+    - Set the `chat-model` field to a [Google Gemini chat model](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models#gemini-models). Example: `gemini-2.0-flash`.
     - Set the `model-type` field to `Google`.
     - Set the `ai model api` field to the Gemini AI Model API you created in step 1.
 

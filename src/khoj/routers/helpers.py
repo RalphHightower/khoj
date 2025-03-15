@@ -357,8 +357,12 @@ async def aget_data_sources_and_output_format(
     source_options_str = ""
 
     agent_sources = agent.input_tools if agent else []
+    user_has_entries = await EntryAdapters.auser_has_entries(user)
 
     for source, description in tool_descriptions_for_llm.items():
+        # Skip showing Notes tool as an option if user has no entries
+        if source == ConversationCommand.Notes and not user_has_entries:
+            continue
         source_options[source.value] = description
         if len(agent_sources) == 0 or source.value in agent_sources:
             source_options_str += f'- "{source.value}": "{description}"\n'
@@ -393,12 +397,15 @@ async def aget_data_sources_and_output_format(
         personality_context=personality_context,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Infer information sources to refer", logger):
         response = await send_message_to_model_wrapper(
             relevant_tools_prompt,
             response_type="json_object",
             user=user,
             query_files=query_files,
+            agent_chat_model=agent_chat_model,
             tracer=tracer,
         )
 
@@ -472,6 +479,8 @@ async def infer_webpage_urls(
         personality_context=personality_context,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Infer webpage urls to read", logger):
         response = await send_message_to_model_wrapper(
             online_queries_prompt,
@@ -479,6 +488,7 @@ async def infer_webpage_urls(
             response_type="json_object",
             user=user,
             query_files=query_files,
+            agent_chat_model=agent_chat_model,
             tracer=tracer,
         )
 
@@ -528,6 +538,8 @@ async def generate_online_subqueries(
         personality_context=personality_context,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Generate online search subqueries", logger):
         response = await send_message_to_model_wrapper(
             online_queries_prompt,
@@ -535,6 +547,7 @@ async def generate_online_subqueries(
             response_type="json_object",
             user=user,
             query_files=query_files,
+            agent_chat_model=agent_chat_model,
             tracer=tracer,
         )
 
@@ -628,10 +641,13 @@ async def extract_relevant_info(
         personality_context=personality_context,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     response = await send_message_to_model_wrapper(
         extract_relevant_information,
         prompts.system_prompt_extract_relevant_information,
         user=user,
+        agent_chat_model=agent_chat_model,
         tracer=tracer,
     )
     return response.strip()
@@ -666,12 +682,15 @@ async def extract_relevant_summary(
         personality_context=personality_context,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Extract relevant information from data", logger):
         response = await send_message_to_model_wrapper(
             extract_relevant_information,
             prompts.system_prompt_extract_relevant_summary,
             user=user,
             query_images=query_images,
+            agent_chat_model=agent_chat_model,
             tracer=tracer,
         )
     return response.strip()
@@ -834,12 +853,15 @@ async def generate_better_diagram_description(
         personality_context=personality_context,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Generate better diagram description", logger):
         response = await send_message_to_model_wrapper(
             improve_diagram_description_prompt,
             query_images=query_images,
             user=user,
             query_files=query_files,
+            agent_chat_model=agent_chat_model,
             tracer=tracer,
         )
         response = response.strip()
@@ -864,9 +886,11 @@ async def generate_excalidraw_diagram_from_description(
         query=q,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Generate excalidraw diagram", logger):
         raw_response = await send_message_to_model_wrapper(
-            query=excalidraw_diagram_generation, user=user, tracer=tracer
+            query=excalidraw_diagram_generation, user=user, agent_chat_model=agent_chat_model, tracer=tracer
         )
         raw_response = clean_json(raw_response)
         try:
@@ -980,12 +1004,15 @@ async def generate_better_mermaidjs_diagram_description(
         personality_context=personality_context,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Generate better Mermaid.js diagram description", logger):
         response = await send_message_to_model_wrapper(
             improve_diagram_description_prompt,
             query_images=query_images,
             user=user,
             query_files=query_files,
+            agent_chat_model=agent_chat_model,
             tracer=tracer,
         )
         response = response.strip()
@@ -1010,8 +1037,12 @@ async def generate_mermaidjs_diagram_from_description(
         query=q,
     )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Generate Mermaid.js diagram", logger):
-        raw_response = await send_message_to_model_wrapper(query=mermaidjs_diagram_generation, user=user, tracer=tracer)
+        raw_response = await send_message_to_model_wrapper(
+            query=mermaidjs_diagram_generation, user=user, agent_chat_model=agent_chat_model, tracer=tracer
+        )
         return clean_mermaidjs(raw_response.strip())
 
 
@@ -1061,7 +1092,11 @@ async def generate_better_image_prompt(
             online_results=simplified_online_results,
             personality_context=personality_context,
         )
-    elif model_type in [TextToImageModelConfig.ModelType.STABILITYAI, TextToImageModelConfig.ModelType.REPLICATE]:
+    elif model_type in [
+        TextToImageModelConfig.ModelType.STABILITYAI,
+        TextToImageModelConfig.ModelType.REPLICATE,
+        TextToImageModelConfig.ModelType.GOOGLE,
+    ]:
         image_prompt = prompts.image_generation_improve_prompt_sd.format(
             query=q,
             chat_history=conversation_history,
@@ -1072,9 +1107,16 @@ async def generate_better_image_prompt(
             personality_context=personality_context,
         )
 
+    agent_chat_model = agent.chat_model if agent else None
+
     with timer("Chat actor: Generate contextual image prompt", logger):
         response = await send_message_to_model_wrapper(
-            image_prompt, query_images=query_images, user=user, query_files=query_files, tracer=tracer
+            image_prompt,
+            query_images=query_images,
+            user=user,
+            query_files=query_files,
+            agent_chat_model=agent_chat_model,
+            tracer=tracer,
         )
         response = response.strip()
         if response.startswith(('"', "'")) and response.endswith(('"', "'")):
@@ -1087,13 +1129,15 @@ async def send_message_to_model_wrapper(
     query: str,
     system_message: str = "",
     response_type: str = "text",
+    deepthought: bool = False,
     user: KhojUser = None,
     query_images: List[str] = None,
     context: str = "",
     query_files: str = None,
+    agent_chat_model: ChatModel = None,
     tracer: dict = {},
 ):
-    chat_model: ChatModel = await ConversationAdapters.aget_default_chat_model(user)
+    chat_model: ChatModel = await ConversationAdapters.aget_default_chat_model(user, agent_chat_model)
     vision_available = chat_model.vision_enabled
     if not vision_available and query_images:
         logger.warning(f"Vision is not enabled for default model: {chat_model.name}.")
@@ -1188,6 +1232,7 @@ async def send_message_to_model_wrapper(
             api_key=api_key,
             model=chat_model_name,
             response_type=response_type,
+            deepthought=deepthought,
             tracer=tracer,
         )
     elif model_type == ChatModel.ModelType.GOOGLE:
@@ -1355,6 +1400,7 @@ def generate_chat_response(
     generated_mermaidjs_diagram: str = None,
     program_execution_context: List[str] = [],
     generated_asset_results: Dict[str, Dict] = {},
+    is_subscribed: bool = False,
     tracer: dict = {},
 ) -> Tuple[Union[ThreadedGenerator, Iterator[str]], Dict[str, str]]:
     # Initialize Variables
@@ -1385,13 +1431,15 @@ def generate_chat_response(
         )
 
         query_to_run = q
+        deepthought = False
         if meta_research:
             query_to_run = f"<query>{q}</query>\n<collected_research>\n{meta_research}\n</collected_research>"
             compiled_references = []
             online_results = {}
             code_results = {}
+            deepthought = True
 
-        chat_model = ConversationAdapters.get_valid_chat_model(user, conversation)
+        chat_model = ConversationAdapters.get_valid_chat_model(user, conversation, is_subscribed)
         vision_available = chat_model.vision_enabled
         if not vision_available and query_images:
             vision_enabled_config = ConversationAdapters.get_vision_enabled_config()
@@ -1473,6 +1521,7 @@ def generate_chat_response(
                 generated_files=raw_generated_files,
                 generated_asset_results=generated_asset_results,
                 program_execution_context=program_execution_context,
+                deepthought=deepthought,
                 tracer=tracer,
             )
         elif chat_model.model_type == ChatModel.ModelType.GOOGLE:
@@ -1977,7 +2026,13 @@ def schedule_automation(
         # Run automation at some random minute (to distribute request load) instead of running every X minutes
         crontime = " ".join([str(math.floor(random() * 60))] + crontime.split(" ")[1:])
 
-    user_timezone = pytz.timezone(timezone)
+    # Convert timezone string to timezone object
+    try:
+        user_timezone = pytz.timezone(timezone)
+    except pytz.UnknownTimeZoneError:
+        logger.error(f"Invalid timezone: {timezone}. Fallback to use UTC to schedule automation.")
+        user_timezone = pytz.utc
+
     trigger = CronTrigger.from_crontab(crontime, user_timezone)
     trigger.jitter = 60
     # Generate id and metadata used by task scheduler and process locks for the task runs
@@ -2231,7 +2286,14 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
     chat_models = ConversationAdapters.get_conversation_processor_options().all()
     chat_model_options = list()
     for chat_model in chat_models:
-        chat_model_options.append({"name": chat_model.name, "id": chat_model.id})
+        chat_model_options.append(
+            {
+                "name": chat_model.name,
+                "id": chat_model.id,
+                "strengths": chat_model.strengths,
+                "description": chat_model.description,
+            }
+        )
 
     selected_paint_model_config = ConversationAdapters.get_user_text_to_image_model_config(user)
     paint_model_options = ConversationAdapters.get_text_to_image_model_options().all()
