@@ -11,7 +11,7 @@ from urllib.parse import unquote
 
 from asgiref.sync import sync_to_async
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from starlette.authentication import has_required_scope, requires
 
 from khoj.app.settings import ALLOWED_HOSTS
@@ -25,7 +25,11 @@ from khoj.database.adapters import (
 from khoj.database.models import Agent, KhojUser
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.prompts import help_message, no_entries_found
-from khoj.processor.conversation.utils import defilter_query, save_to_conversation_log
+from khoj.processor.conversation.utils import (
+    ResponseWithThought,
+    defilter_query,
+    save_to_conversation_log,
+)
 from khoj.processor.image.generate import text_to_image
 from khoj.processor.speech.text_to_speech import generate_text_to_speech
 from khoj.processor.tools.online_search import (
@@ -64,10 +68,9 @@ from khoj.routers.research import (
     InformationCollectionIteration,
     execute_information_collection,
 )
-from khoj.routers.storage import upload_image_to_bucket
+from khoj.routers.storage import upload_user_image_to_bucket
 from khoj.utils import state
 from khoj.utils.helpers import (
-    AsyncIteratorWrapper,
     ConversationCommand,
     command_descriptions,
     convert_image_to_webp,
@@ -255,6 +258,7 @@ def chat_history(
             "conversation_id": conversation.id,
             "slug": conversation.title if conversation.title else conversation.slug,
             "agent": agent_metadata,
+            "is_owner": conversation.user == user,
         }
     )
 
@@ -332,6 +336,7 @@ def get_shared_chat(
             "conversation_id": conversation.id,
             "slug": scrubbed_title,
             "agent": agent_metadata,
+            "is_owner": conversation.source_owner == user,
         }
     )
 
@@ -446,6 +451,33 @@ def duplicate_chat_history_public_conversation(
 
     return Response(
         status_code=200, content=json.dumps({"status": "ok", "url": f"{scheme}://{domain}{public_conversation_url}"})
+    )
+
+
+@api_chat.delete("/share")
+@requires(["authenticated"])
+def delete_public_conversation(
+    request: Request,
+    common: CommonQueryParams,
+    public_conversation_slug: str,
+):
+    user = request.user.object
+
+    # Delete Public Conversation
+    PublicConversationAdapters.delete_public_conversation_by_slug(user=user, slug=public_conversation_slug)
+
+    update_telemetry_state(
+        request=request,
+        telemetry_type="api",
+        api="delete_chat_share",
+        **common.__dict__,
+    )
+
+    # Redirect to the main chat page
+    redirect_uri = str(request.app.url_path_for("chat_page"))
+    return RedirectResponse(
+        url=redirect_uri,
+        status_code=301,
     )
 
 
@@ -674,9 +706,11 @@ async def chat(
                 base64_data = decoded_string.split(",", 1)[1]
                 image_bytes = base64.b64decode(base64_data)
                 webp_image_bytes = convert_image_to_webp(image_bytes)
-                uploaded_image = upload_image_to_bucket(webp_image_bytes, request.user.object.id)
-                if uploaded_image:
-                    uploaded_images.append(uploaded_image)
+                uploaded_image = upload_user_image_to_bucket(webp_image_bytes, request.user.object.id)
+                if not uploaded_image:
+                    base64_webp_image = base64.b64encode(webp_image_bytes).decode("utf-8")
+                    uploaded_image = f"data:image/webp;base64,{base64_webp_image}"
+                uploaded_images.append(uploaded_image)
 
         query_files: Dict[str, str] = {}
         if raw_query_files:
@@ -696,6 +730,16 @@ async def chat(
                     ttft = time.perf_counter() - start_time
                 elif event_type == ChatEvent.STATUS:
                     train_of_thought.append({"type": event_type.value, "data": data})
+                elif event_type == ChatEvent.THOUGHT:
+                    # Append the data to the last thought as thoughts are streamed
+                    if (
+                        len(train_of_thought) > 0
+                        and train_of_thought[-1]["type"] == ChatEvent.THOUGHT.value
+                        and type(train_of_thought[-1]["data"]) == type(data) == str
+                    ):
+                        train_of_thought[-1]["data"] += data
+                    else:
+                        train_of_thought.append({"type": event_type.value, "data": data})
 
                 if event_type == ChatEvent.MESSAGE:
                     yield data
@@ -858,7 +902,6 @@ async def chat(
 
         if conversation_commands == [ConversationCommand.Research]:
             async for research_result in execute_information_collection(
-                request=request,
                 user=user,
                 query=defiltered_query,
                 conversation_id=conversation_id,
@@ -969,22 +1012,26 @@ async def chat(
                 return
 
             llm_response = construct_automation_created_message(automation, crontime, query_to_run, subject)
-            await sync_to_async(save_to_conversation_log)(
-                q,
-                llm_response,
-                user,
-                meta_log,
-                user_message_time,
-                intent_type="automation",
-                client_application=request.user.client_app,
-                conversation_id=conversation_id,
-                inferred_queries=[query_to_run],
-                automation_id=automation.id,
-                query_images=uploaded_images,
-                train_of_thought=train_of_thought,
-                raw_query_files=raw_query_files,
-                tracer=tracer,
+            # Trigger task to save conversation to DB
+            asyncio.create_task(
+                save_to_conversation_log(
+                    q,
+                    llm_response,
+                    user,
+                    meta_log,
+                    user_message_time,
+                    intent_type="automation",
+                    client_application=request.user.client_app,
+                    conversation_id=conversation_id,
+                    inferred_queries=[query_to_run],
+                    automation_id=automation.id,
+                    query_images=uploaded_images,
+                    train_of_thought=train_of_thought,
+                    raw_query_files=raw_query_files,
+                    tracer=tracer,
+                )
             )
+            # Send LLM Response
             async for result in send_llm_response(llm_response, tracer.get("usage")):
                 yield result
             return
@@ -994,7 +1041,7 @@ async def chat(
         if not ConversationCommand.Research in conversation_commands:
             try:
                 async for result in extract_references_and_questions(
-                    request,
+                    user,
                     meta_log,
                     q,
                     (n or 7),
@@ -1075,6 +1122,7 @@ async def chat(
                     location,
                     user,
                     partial(send_event, ChatEvent.STATUS),
+                    max_webpages_to_read=1,
                     query_images=uploaded_images,
                     agent=agent,
                     query_files=attached_file_context,
@@ -1272,31 +1320,42 @@ async def chat(
             tracer,
         )
 
-        # Send Response
-        async for result in send_event(ChatEvent.START_LLM_RESPONSE, ""):
-            yield result
-
         continue_stream = True
-        iterator = AsyncIteratorWrapper(llm_response)
-        async for item in iterator:
+        async for item in llm_response:
+            # Should not happen with async generator, end is signaled by loop exit. Skip.
             if item is None:
-                async for result in send_event(ChatEvent.END_LLM_RESPONSE, ""):
-                    yield result
-                # Send Usage Metadata once llm interactions are complete
-                async for event in send_event(ChatEvent.USAGE, tracer.get("usage")):
-                    yield event
-                async for result in send_event(ChatEvent.END_RESPONSE, ""):
-                    yield result
-                logger.debug("Finished streaming response")
-                return
-            if not connection_alive or not continue_stream:
                 continue
+            if not connection_alive or not continue_stream:
+                # Drain the generator if disconnected but keep processing internally
+                continue
+            message = item.response if isinstance(item, ResponseWithThought) else item
+            if isinstance(item, ResponseWithThought) and item.thought:
+                async for result in send_event(ChatEvent.THOUGHT, item.thought):
+                    yield result
+                continue
+
+            # Start sending response
+            async for result in send_event(ChatEvent.START_LLM_RESPONSE, ""):
+                yield result
+
             try:
-                async for result in send_event(ChatEvent.MESSAGE, f"{item}"):
+                async for result in send_event(ChatEvent.MESSAGE, message):
                     yield result
             except Exception as e:
                 continue_stream = False
-                logger.info(f"User {user} disconnected. Emitting rest of responses to clear thread: {e}")
+                logger.info(f"User {user} disconnected or error during streaming. Stopping send: {e}")
+
+        # Signal end of LLM response after the loop finishes
+        if connection_alive:
+            async for result in send_event(ChatEvent.END_LLM_RESPONSE, ""):
+                yield result
+            # Send Usage Metadata once llm interactions are complete
+            if tracer.get("usage"):
+                async for event in send_event(ChatEvent.USAGE, tracer.get("usage")):
+                    yield event
+            async for result in send_event(ChatEvent.END_RESPONSE, ""):
+                yield result
+            logger.debug("Finished streaming response")
 
     ## Stream Text Response
     if stream:

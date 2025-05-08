@@ -52,12 +52,21 @@ except ImportError:
 model_to_prompt_size = {
     # OpenAI Models
     "gpt-4o": 60000,
-    "gpt-4o-mini": 60000,
+    "gpt-4o-mini": 120000,
+    "gpt-4.1": 60000,
+    "gpt-4.1-mini": 120000,
+    "gpt-4.1-nano": 120000,
     "o1": 20000,
+    "o3": 30000,
     "o1-mini": 60000,
     "o3-mini": 60000,
+    "o4-mini": 60000,
     # Google Models
-    "gemini-1.5-flash": 60000,
+    "gemini-2.5-flash-preview-04-17": 120000,
+    "gemini-2.5-pro-preview-03-25": 60000,
+    "gemini-2.0-flash": 120000,
+    "gemini-2.0-flash-lite": 120000,
+    "gemini-1.5-flash": 120000,
     "gemini-1.5-pro": 60000,
     # Anthropic Models
     "claude-3-5-sonnet-20241022": 60000,
@@ -73,42 +82,6 @@ model_to_prompt_size = {
     "bartowski/gemma-2-2b-it-GGUF": 6000,
 }
 model_to_tokenizer: Dict[str, str] = {}
-
-
-class ThreadedGenerator:
-    def __init__(self, compiled_references, online_results, completion_func=None):
-        self.queue = queue.Queue()
-        self.compiled_references = compiled_references
-        self.online_results = online_results
-        self.completion_func = completion_func
-        self.response = ""
-        self.start_time = perf_counter()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        item = self.queue.get()
-        if item is StopIteration:
-            time_to_response = perf_counter() - self.start_time
-            logger.info(f"Chat streaming took: {time_to_response:.3f} seconds")
-            if self.completion_func:
-                # The completion func effectively acts as a callback.
-                # It adds the aggregated response to the conversation history.
-                self.completion_func(chat_response=self.response)
-            raise StopIteration
-        return item
-
-    def send(self, data):
-        if self.response == "":
-            time_to_first_response = perf_counter() - self.start_time
-            logger.info(f"First response took: {time_to_first_response:.3f} seconds")
-
-        self.response += data
-        self.queue.put(data)
-
-    def close(self):
-        self.queue.put(StopIteration)
 
 
 class InformationCollectionIteration:
@@ -218,6 +191,7 @@ class ChatEvent(Enum):
     REFERENCES = "references"
     GENERATED_ASSETS = "generated_assets"
     STATUS = "status"
+    THOUGHT = "thought"
     METADATA = "metadata"
     USAGE = "usage"
     END_RESPONSE = "end_response"
@@ -252,7 +226,7 @@ def message_to_log(
     return conversation_log
 
 
-def save_to_conversation_log(
+async def save_to_conversation_log(
     q: str,
     chat_response: str,
     user: KhojUser,
@@ -304,7 +278,7 @@ def save_to_conversation_log(
         khoj_message_metadata=khoj_message_metadata,
         conversation_log=meta_log.get("chat", []),
     )
-    ConversationAdapters.save_conversation(
+    await ConversationAdapters.save_conversation(
         user,
         {"chat": updated_conversation},
         client_application=client_application,
@@ -345,8 +319,7 @@ def construct_structured_message(
             constructed_messages.append({"type": "text", "text": attached_file_context})
         if vision_enabled and images:
             for image in images:
-                if image.startswith("https://"):
-                    constructed_messages.append({"type": "image_url", "image_url": {"url": image}})
+                constructed_messages.append({"type": "image_url", "image_url": {"url": image}})
         return constructed_messages
 
     if not is_none_or_empty(attached_file_context):
@@ -664,6 +637,23 @@ class ImageWithType:
     type: str
 
 
+def get_image_from_base64(image: str, type="b64"):
+    # Extract image type and base64 data from inline image data
+    image_base64 = image.split(",", 1)[1]
+    image_type = image.split(";", 1)[0].split(":", 1)[1]
+
+    # Convert image to desired format
+    if type == "b64":
+        return ImageWithType(content=image_base64, type=image_type)
+    elif type == "pil":
+        image_data = base64.b64decode(image_base64)
+        image_pil = PIL.Image.open(BytesIO(image_data))
+        return ImageWithType(content=image_pil, type=image_type)
+    elif type == "bytes":
+        image_data = base64.b64decode(image_base64)
+        return ImageWithType(content=image_data, type=image_type)
+
+
 def get_image_from_url(image_url: str, type="pil"):
     try:
         response = requests.get(image_url)
@@ -878,3 +868,15 @@ def messages_to_print(messages: list[ChatMessage], max_length: int = 70) -> str:
             return str(content)
 
     return "\n".join([f"{json.dumps(safe_serialize(message.content))[:max_length]}..." for message in messages])
+
+
+class JsonSupport(int, Enum):
+    NONE = 0
+    OBJECT = 1
+    SCHEMA = 2
+
+
+class ResponseWithThought:
+    def __init__(self, response: str = None, thought: str = None):
+        self.response = response
+        self.thought = thought

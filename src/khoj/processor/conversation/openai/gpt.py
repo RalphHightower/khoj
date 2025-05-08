@@ -1,17 +1,23 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 import pyjson5
 from langchain.schema import ChatMessage
+from openai.lib._pydantic import _ensure_strict_json_schema
+from pydantic import BaseModel
 
 from khoj.database.models import Agent, ChatModel, KhojUser
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.openai.utils import (
     chat_completion_with_backoff,
     completion_with_backoff,
+    get_openai_api_json_support,
 )
 from khoj.processor.conversation.utils import (
+    JsonSupport,
+    ResponseWithThought,
     clean_json,
     construct_structured_message,
     generate_chatml_messages_with_context,
@@ -61,7 +67,6 @@ def extract_questions(
     today = datetime.today()
     current_new_year = today.replace(month=1, day=1)
     last_new_year = current_new_year.replace(year=today.year - 1)
-    temperature = 0.7
 
     prompt = prompts.extract_questions.format(
         current_date=today.strftime("%Y-%m-%d"),
@@ -97,7 +102,6 @@ def extract_questions(
         model,
         response_type="json_object",
         api_base_url=api_base_url,
-        temperature=temperature,
         tracer=tracer,
     )
 
@@ -119,25 +123,48 @@ def extract_questions(
 
 
 def send_message_to_model(
-    messages, api_key, model, response_type="text", api_base_url=None, temperature=0, tracer: dict = {}
+    messages,
+    api_key,
+    model,
+    response_type="text",
+    response_schema=None,
+    deepthought=False,
+    api_base_url=None,
+    tracer: dict = {},
 ):
     """
     Send message to model
     """
+
+    model_kwargs = {}
+    json_support = get_openai_api_json_support(model, api_base_url)
+    if response_schema and json_support == JsonSupport.SCHEMA:
+        # Drop unsupported fields from schema passed to OpenAI APi
+        cleaned_response_schema = clean_response_schema(response_schema)
+        model_kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "schema": cleaned_response_schema,
+                "name": response_schema.__name__,
+                "strict": True,
+            },
+        }
+    elif response_type == "json_object" and json_support == JsonSupport.OBJECT:
+        model_kwargs["response_format"] = {"type": response_type}
 
     # Get Response from GPT
     return completion_with_backoff(
         messages=messages,
         model_name=model,
         openai_api_key=api_key,
-        temperature=temperature,
         api_base_url=api_base_url,
-        model_kwargs={"response_format": {"type": response_type}},
+        deepthought=deepthought,
+        model_kwargs=model_kwargs,
         tracer=tracer,
     )
 
 
-def converse_openai(
+async def converse_openai(
     references,
     user_query,
     online_results: Optional[Dict[str, Dict]] = None,
@@ -146,7 +173,7 @@ def converse_openai(
     model: str = "gpt-4o-mini",
     api_key: Optional[str] = None,
     api_base_url: Optional[str] = None,
-    temperature: float = 0.2,
+    temperature: float = 0.4,
     completion_func=None,
     conversation_commands=[ConversationCommand.Default],
     max_prompt_size=None,
@@ -160,8 +187,9 @@ def converse_openai(
     generated_files: List[FileAttachment] = None,
     generated_asset_results: Dict[str, Dict] = {},
     program_execution_context: List[str] = None,
+    deepthought: Optional[bool] = False,
     tracer: dict = {},
-):
+) -> AsyncGenerator[ResponseWithThought, None]:
     """
     Converse with user using OpenAI's ChatGPT
     """
@@ -191,11 +219,17 @@ def converse_openai(
 
     # Get Conversation Primer appropriate to Conversation Type
     if conversation_commands == [ConversationCommand.Notes] and is_none_or_empty(references):
-        completion_func(chat_response=prompts.no_notes_found.format())
-        return iter([prompts.no_notes_found.format()])
+        response = prompts.no_notes_found.format()
+        if completion_func:
+            asyncio.create_task(completion_func(chat_response=response))
+        yield response
+        return
     elif conversation_commands == [ConversationCommand.Online] and is_none_or_empty(online_results):
-        completion_func(chat_response=prompts.no_online_results_found.format())
-        return iter([prompts.no_online_results_found.format()])
+        response = prompts.no_online_results_found.format()
+        if completion_func:
+            asyncio.create_task(completion_func(chat_response=response))
+        yield response
+        return
 
     context_message = ""
     if not is_none_or_empty(references):
@@ -229,15 +263,48 @@ def converse_openai(
     logger.debug(f"Conversation Context for GPT: {messages_to_print(messages)}")
 
     # Get Response from GPT
-    return chat_completion_with_backoff(
+    full_response = ""
+    async for chunk in chat_completion_with_backoff(
         messages=messages,
-        compiled_references=references,
-        online_results=online_results,
         model_name=model,
         temperature=temperature,
         openai_api_key=api_key,
         api_base_url=api_base_url,
-        completion_func=completion_func,
+        deepthought=deepthought,
         model_kwargs={"stop": ["Notes:\n["]},
         tracer=tracer,
-    )
+    ):
+        if chunk.response:
+            full_response += chunk.response
+        yield chunk
+
+    # Call completion_func once finish streaming and we have the full response
+    if completion_func:
+        asyncio.create_task(completion_func(chat_response=full_response))
+
+
+def clean_response_schema(schema: BaseModel | dict) -> dict:
+    """
+    Format response schema to be compatible with OpenAI API.
+
+    Clean the response schema by removing unsupported fields.
+    """
+    # Normalize schema to OpenAI compatible JSON schema format
+    schema_json = schema if isinstance(schema, dict) else schema.model_json_schema()
+    schema_json = _ensure_strict_json_schema(schema_json, path=(), root=schema_json)
+
+    # Recursively drop unsupported fields from schema passed to OpenAI API
+    # See https://platform.openai.com/docs/guides/structured-outputs#supported-schemas
+    fields_to_exclude = ["minItems", "maxItems"]
+    if isinstance(schema_json, dict) and isinstance(schema_json.get("properties"), dict):
+        for _, prop_value in schema_json["properties"].items():
+            if isinstance(prop_value, dict):
+                # Remove specified fields from direct properties
+                for field in fields_to_exclude:
+                    prop_value.pop(field, None)
+            # Recursively remove specified fields from child properties
+            if "items" in prop_value and isinstance(prop_value["items"], dict):
+                clean_response_schema(prop_value["items"])
+
+    # Return cleaned schema
+    return schema_json

@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 import pyjson5
 from langchain.schema import ChatMessage
@@ -13,6 +14,7 @@ from khoj.processor.conversation.anthropic.utils import (
     format_messages_for_anthropic,
 )
 from khoj.processor.conversation.utils import (
+    ResponseWithThought,
     clean_json,
     construct_structured_message,
     generate_chatml_messages_with_context,
@@ -34,7 +36,7 @@ def extract_questions_anthropic(
     model: Optional[str] = "claude-3-7-sonnet-latest",
     conversation_log={},
     api_key=None,
-    temperature=0.7,
+    api_base_url=None,
     location_data: LocationData = None,
     user: KhojUser = None,
     query_images: Optional[list[str]] = None,
@@ -82,7 +84,7 @@ def extract_questions_anthropic(
         text=text,
     )
 
-    prompt = construct_structured_message(
+    content = construct_structured_message(
         message=prompt,
         images=query_images,
         model_type=ChatModel.ModelType.ANTHROPIC,
@@ -90,18 +92,14 @@ def extract_questions_anthropic(
         attached_file_context=query_files,
     )
 
-    messages = []
-
-    messages.append(ChatMessage(content=prompt, role="user"))
-
-    messages, system_prompt = format_messages_for_anthropic(messages, system_prompt)
+    messages = [ChatMessage(content=content, role="user")]
 
     response = anthropic_completion_with_backoff(
         messages=messages,
         system_prompt=system_prompt,
         model_name=model,
-        temperature=temperature,
         api_key=api_key,
+        api_base_url=api_base_url,
         response_type="json_object",
         tracer=tracer,
     )
@@ -122,25 +120,26 @@ def extract_questions_anthropic(
     return questions
 
 
-def anthropic_send_message_to_model(messages, api_key, model, response_type="text", deepthought=False, tracer={}):
+def anthropic_send_message_to_model(
+    messages, api_key, api_base_url, model, response_type="text", deepthought=False, tracer={}
+):
     """
     Send message to model
     """
-    messages, system_prompt = format_messages_for_anthropic(messages)
-
     # Get Response from GPT. Don't use response_type because Anthropic doesn't support it.
     return anthropic_completion_with_backoff(
         messages=messages,
-        system_prompt=system_prompt,
+        system_prompt="",
         model_name=model,
         api_key=api_key,
+        api_base_url=api_base_url,
         response_type=response_type,
         deepthought=deepthought,
         tracer=tracer,
     )
 
 
-def converse_anthropic(
+async def converse_anthropic(
     references,
     user_query,
     online_results: Optional[Dict[str, Dict]] = None,
@@ -148,6 +147,7 @@ def converse_anthropic(
     conversation_log={},
     model: Optional[str] = "claude-3-7-sonnet-latest",
     api_key: Optional[str] = None,
+    api_base_url: Optional[str] = None,
     completion_func=None,
     conversation_commands=[ConversationCommand.Default],
     max_prompt_size=None,
@@ -163,7 +163,7 @@ def converse_anthropic(
     generated_asset_results: Dict[str, Dict] = {},
     deepthought: Optional[bool] = False,
     tracer: dict = {},
-):
+) -> AsyncGenerator[ResponseWithThought, None]:
     """
     Converse with user using Anthropic's Claude
     """
@@ -193,11 +193,17 @@ def converse_anthropic(
 
     # Get Conversation Primer appropriate to Conversation Type
     if conversation_commands == [ConversationCommand.Notes] and is_none_or_empty(references):
-        completion_func(chat_response=prompts.no_notes_found.format())
-        return iter([prompts.no_notes_found.format()])
+        response = prompts.no_notes_found.format()
+        if completion_func:
+            asyncio.create_task(completion_func(chat_response=response))
+        yield response
+        return
     elif conversation_commands == [ConversationCommand.Online] and is_none_or_empty(online_results):
-        completion_func(chat_response=prompts.no_online_results_found.format())
-        return iter([prompts.no_online_results_found.format()])
+        response = prompts.no_online_results_found.format()
+        if completion_func:
+            asyncio.create_task(completion_func(chat_response=response))
+        yield response
+        return
 
     context_message = ""
     if not is_none_or_empty(references):
@@ -227,20 +233,25 @@ def converse_anthropic(
         program_execution_context=program_execution_context,
     )
 
-    messages, system_prompt = format_messages_for_anthropic(messages, system_prompt)
     logger.debug(f"Conversation Context for Claude: {messages_to_print(messages)}")
 
     # Get Response from Claude
-    return anthropic_chat_completion_with_backoff(
+    full_response = ""
+    async for chunk in anthropic_chat_completion_with_backoff(
         messages=messages,
-        compiled_references=references,
-        online_results=online_results,
         model_name=model,
-        temperature=0,
+        temperature=0.2,
         api_key=api_key,
+        api_base_url=api_base_url,
         system_prompt=system_prompt,
-        completion_func=completion_func,
         max_prompt_size=max_prompt_size,
         deepthought=deepthought,
         tracer=tracer,
-    )
+    ):
+        if chunk.response:
+            full_response += chunk.response
+        yield chunk
+
+    # Call completion_func once finish streaming and we have the full response
+    if completion_func:
+        asyncio.create_task(completion_func(chat_response=full_response))

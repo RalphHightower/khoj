@@ -1,11 +1,14 @@
 import logging
+import os
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Type
 
 import yaml
 from fastapi import Request
+from pydantic import BaseModel, Field
 
-from khoj.database.adapters import EntryAdapters
+from khoj.database.adapters import AgentAdapters, EntryAdapters
 from khoj.database.models import Agent, KhojUser
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.utils import (
@@ -35,6 +38,42 @@ from khoj.utils.rawconfig import LocationData
 logger = logging.getLogger(__name__)
 
 
+class PlanningResponse(BaseModel):
+    """
+    Schema for the response from planning agent when deciding the next tool to pick.
+    """
+
+    scratchpad: str = Field(..., description="Scratchpad to reason about which tool to use next")
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    @classmethod
+    def create_model_with_enum(cls: Type["PlanningResponse"], tool_options: dict) -> Type["PlanningResponse"]:
+        """
+        Factory method that creates a customized PlanningResponse model
+        with a properly typed tool field based on available tools.
+
+        The tool field is dynamically generated based on available tools.
+        The query field should be filled by the model after the tool field for a more logical reasoning flow.
+
+        Args:
+            tool_options: Dictionary mapping tool names to values
+
+        Returns:
+            A customized PlanningResponse class
+        """
+        # Create dynamic enum from tool options
+        tool_enum = Enum("ToolEnum", tool_options)  # type: ignore
+
+        # Create and return a customized response model with the enum
+        class PlanningResponseWithTool(PlanningResponse):
+            tool: tool_enum = Field(..., description="Name of the tool to use")
+            query: str = Field(..., description="Detailed query for the selected tool")
+
+        return PlanningResponseWithTool
+
+
 async def apick_next_tool(
     query: str,
     conversation_history: dict,
@@ -60,9 +99,13 @@ async def apick_next_tool(
         # Skip showing Notes tool as an option if user has no entries
         if tool == ConversationCommand.Notes and not user_has_entries:
             continue
-        tool_options[tool.value] = description
+        # Add tool if agent does not have any tools defined or the tool is supported by the agent.
         if len(agent_tools) == 0 or tool.value in agent_tools:
+            tool_options[tool.name] = tool.value
             tool_options_str += f'- "{tool.value}": "{description}"\n'
+
+    # Create planning reponse model with dynamically populated tool enum class
+    planning_response_model = PlanningResponse.create_model_with_enum(tool_options)
 
     # Construct chat history with user and iteration history with researcher agent for context
     chat_history = construct_chat_history(conversation_history, agent_name=agent.name if agent else "Khoj")
@@ -73,6 +116,7 @@ async def apick_next_tool(
 
     today = datetime.today()
     location_data = f"{location}" if location else "Unknown"
+    agent_chat_model = AgentAdapters.get_agent_chat_model(agent, user) if agent else None
     personality_context = (
         prompts.personality_context.format(personality=agent.personality) if agent and agent.personality else ""
     )
@@ -95,10 +139,12 @@ async def apick_next_tool(
                 query=query,
                 context=function_planning_prompt,
                 response_type="json_object",
+                response_schema=planning_response_model,
                 deepthought=True,
                 user=user,
                 query_images=query_images,
                 query_files=query_files,
+                agent_chat_model=agent_chat_model,
                 tracer=tracer,
             )
     except Exception as e:
@@ -125,7 +171,9 @@ async def apick_next_tool(
         # Only send client status updates if we'll execute this iteration
         elif send_status_func:
             determined_tool_message = "**Determined Tool**: "
-            determined_tool_message += f"{selected_tool}({generated_query})." if selected_tool else "respond."
+            determined_tool_message += (
+                f"{selected_tool}({generated_query})." if selected_tool != ConversationCommand.Text else "respond."
+            )
             determined_tool_message += f"\nReason: {scratchpad}" if scratchpad else ""
             async for event in send_status_func(f"{scratchpad}"):
                 yield {ChatEvent.STATUS: event}
@@ -145,7 +193,6 @@ async def apick_next_tool(
 
 
 async def execute_information_collection(
-    request: Request,
     user: KhojUser,
     query: str,
     conversation_id: str,
@@ -160,7 +207,7 @@ async def execute_information_collection(
     query_files: str = None,
 ):
     current_iteration = 0
-    MAX_ITERATIONS = 5
+    MAX_ITERATIONS = int(os.getenv("KHOJ_RESEARCH_ITERATIONS", 5))
     previous_iterations: List[InformationCollectionIteration] = []
     while current_iteration < MAX_ITERATIONS:
         online_results: Dict = dict()
@@ -192,6 +239,10 @@ async def execute_information_collection(
         if this_iteration.warning:
             logger.warning(f"Research mode: {this_iteration.warning}.")
 
+        # Terminate research if selected text tool or query, tool not set for next iteration
+        elif not this_iteration.query or not this_iteration.tool or this_iteration.tool == ConversationCommand.Text:
+            current_iteration = MAX_ITERATIONS
+
         elif this_iteration.tool == ConversationCommand.Notes:
             this_iteration.context = []
             document_results = []
@@ -199,7 +250,7 @@ async def execute_information_collection(
                 c["query"] for iteration in previous_iterations if iteration.context for c in iteration.context
             }
             async for result in extract_references_and_questions(
-                request,
+                user,
                 construct_tool_chat_history(previous_iterations, ConversationCommand.Notes),
                 this_iteration.query,
                 7,
@@ -274,6 +325,7 @@ async def execute_information_collection(
                     location,
                     user,
                     send_status_func,
+                    max_webpages_to_read=1,
                     query_images=query_images,
                     agent=agent,
                     tracer=tracer,
